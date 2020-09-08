@@ -1,0 +1,194 @@
+#include <stdio.h>
+#include <string.h>
+#include "parser.h"
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <signal.h>
+#include <dirent.h>
+
+#define LEER 0
+#define ESCRIBIR 1
+int main(int argc,char **argv){
+	char *buf;
+	tline *comandos;
+	int i,j;
+	pid_t *pid_hijos;
+	int tub_entrada[2];
+	int tub_salida[2];
+	int entradaEstandar;
+	int salidaEstandar;
+	int errorEstandar;
+	FILE *file;
+	char dir_actual[1024];
+	
+	system("clear");
+	signal(SIGINT,SIG_IGN);			//ignorar la señal SIG_INT
+	signal(SIGQUIT,SIG_IGN);			//ignorar la señal SIG_QUIT
+	buf=(char *) malloc(1024*sizeof(char));
+	printf("msh> ");
+	//Guardamos descriptores de fichero estandars
+	entradaEstandar=dup(0);
+	salidaEstandar=dup(1);
+	errorEstandar=dup(2);
+	while((fgets(buf,1024,stdin)!=NULL)&&(strcmp(buf,"exit\n")!=0)){
+		comandos=tokenize(buf);
+		if(comandos==NULL){
+			continue;//No se recibió ningún comando
+		}
+		else{//else se reciben comandos
+			if(comandos->ncommands==1){//Solo hay un mandato vamos a comprobar si ese mandato es cd para no crear los procesos
+				if(strcmp(comandos->commands[0].argv[0],"cd")==0){//Comprobamos si ese mandato es cd
+					if(comandos->commands[0].argc>2){//cd solo funciona con ninguno o un argumento
+						fprintf(stderr,"El mandato cd solo funciona con uno o ningún argumento\n");
+						continue;
+					}
+					else{
+						if(comandos->commands[0].argc==1){
+						//No se le ha pasado argumentos cambiamos directorio a HOME
+						chdir(getenv("HOME"));
+						getcwd(dir_actual,sizeof(dir_actual));
+						printf("Directorio actual : %s \n",dir_actual);
+						//ACABA
+						goto fin;
+						}
+						else if(comandos->commands[0].argc==2){
+						//Se le ha pasado un directorio
+						DIR* directorio=opendir(comandos->commands[0].argv[1]);
+						if(directorio){
+							chdir(comandos->commands[0].argv[1]);
+							//Si existe y es valido cambiamos el directorio actual a ese
+							getcwd(dir_actual,sizeof(dir_actual));
+							//Guardamos el directorio en el que estamos
+							printf("Directorio actual: %s \n",dir_actual);
+							//ACABA
+							goto fin;
+						}
+						else{
+							fprintf(stderr,"El directorio introducido con el comando cd no es válido.\n");
+							continue;
+						}
+						}
+					}
+				}//if cd
+			}//if un mandato que es el cd, si es un mandato y no es cd continua
+			//Comprobamos redirecciones de entrada salida y error
+			if(comandos->redirect_input !=NULL){
+				file =fopen(comandos->redirect_input,"r");
+				//Abrimos fichero modo lectura (r)
+				if(file==NULL){
+				//No existe fichero
+				fprintf(stderr,"%s : Error. %s \n",comandos->redirect_input,strerror(errno));
+				//ACABA
+				goto fin;
+				}
+				else{
+				//Existe fichero
+				int input =fileno(file);
+				dup2(input,0);//Descriptor de fichero como entrada estandar
+				fclose(file);//Cerramos descriptor de fichero
+				}
+			}
+			if(comandos->redirect_output !=NULL){
+			file =fopen(comandos->redirect_output,"a");
+                                //Abrimos fichero modo escritura (a)
+                                if(file==NULL){
+                                //No existe fichero
+                                fprintf(stderr,"%s : Error. %s \n",comandos->redirect_output,strerror(errno));
+                                //ACABA
+				goto fin;
+                                }
+                                else{
+                                //Existe fichero
+                                int output =fileno(file);
+                                dup2(output,1);//Descriptor de fichero como salida estandar
+                                fclose(file);//Cerramos descriptor de fichero
+                                }
+
+			}
+			if(comandos->redirect_error !=NULL){
+			file =fopen(comandos->redirect_output,"a");
+                                //Abrimos fichero modo escritura (a)
+                                if(file==NULL){
+                                //No existe fichero
+                                fprintf(stderr,"%s : Error. %s \n",comandos->redirect_error,strerror(errno));
+                                //ACABA
+				goto fin;
+                                }
+                                else{
+                                //Existe fichero
+                                int err =fileno(file);
+                                dup2(err,2);//Descriptor de fichero como salida estandar
+                                fclose(file);//Cerramos descriptor de fichero
+                                }
+
+			}
+			//Creamos espacio para tantos hijos como mandatos
+			pid_hijos=(pid_t *) malloc (comandos->ncommands*sizeof(pid_t));
+			pipe(tub_entrada);//Creamos tuberia de entrada
+			for(i=0;i< comandos->ncommands;i++){
+				if(i!=comandos->ncommands-1){
+					pipe(tub_salida);//Creamos una tubería para todos los procesos que no sean el último
+				}
+				pid_hijos[i]=fork();//Creamos hijo i
+				if(pid_hijos[i]<0){
+					fprintf(stderr,"No se pudo crear el hijo %d \n %s \n",i,strerror(errno));
+					continue;
+				}
+				if(pid_hijos[i]==0){//Se trata del código de los hijos
+					signal(SIGINT,SIG_DFL);                 //señal SIG_INT por defecto
+					signal(SIGQUIT,SIG_DFL);                        //señal SIG_QUIT por defecto
+					if(comandos->commands[i].filename==NULL){//Comando no existe
+						fprintf(stderr,"%s: No se encuentra el mandato.\n",comandos->commands[i].filename);
+                   				continue;
+					}
+					else{//Existe mandato
+					if((i<0)&&(strcmp( comandos->commands[i].filename,"cd")==0)){
+						fprintf(stderr,"No se puede ejecutar cd con otro comando\n");
+					}//Fallo comando cd con más de un comando en la linea
+					else{//No es cd
+						if(i>0){//Todos menos primero redireccionan entrada a la tubería
+							close(tub_entrada[ESCRIBIR]);//En la tuberia de entrada no escriben
+							dup2(tub_entrada[LEER],0);//Descriptor de tuberia de entrada como entrada estandar
+						}
+						if(i!=comandos->ncommands-1){//Todos menos el último mandato redireccionan salida a la tubería
+							close(tub_salida[LEER]);//En la tubería de salida no se leenada
+							dup2(tub_salida[ESCRIBIR],1);//Descriptor de tuberia salida como salida estandar
+						}
+					}
+					execv(comandos->commands[i].filename,comandos->commands[i].argv);//Hijo i ejecuta mandato i
+					//Si execv fallla sigue corriendo el programa, sino, continua
+					fprintf(stderr,"Fallo al ejecutar el mandato %s\n%s\n",comandos->commands[i].filename,strerror(errno));
+                    			exit(1);
+					}//else existe mandato
+				}//Código hijos
+				else{//Codigo padre
+					close(tub_entrada[LEER]);
+					close(tub_entrada[ESCRIBIR]);
+					if(i!=comandos->ncommands-1){
+					/*En todos menos el último, hacemos coincidir la tubería de entrada para leer
+					con la salida del mandato anterior*/
+						tub_entrada[LEER]=tub_salida[LEER];
+						tub_entrada[ESCRIBIR]=tub_salida[ESCRIBIR];
+					}
+					for(j=0;j < comandos-> ncommands;j++){
+						waitpid(pid_hijos[j],NULL,0);
+					}
+					//free(pid_hijos);
+				}//Codigo padre
+
+			}//For
+		}//else se reciben mandatos
+//Restablecemos valores de entrada, salida y error a lo original
+//Liberamos espacio de los pids de los hijos
+		free(pid_hijos);
+fin:		dup2(entradaEstandar,0);
+      		dup2(salidaEstandar,1);
+      		dup2(errorEstandar,2);
+                printf("msh> ");
+	}//Recibir Mandatos
+return 0;
+}
